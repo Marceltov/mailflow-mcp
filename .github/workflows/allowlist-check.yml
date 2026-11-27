@@ -1,0 +1,30 @@
+name: MailFlow allowlist check
+
+# Daily: has MailFlow's API-token allowlist (the routes a token may call) changed upstream? If so,
+# open one issue (not one per day) so the tools are checked against it.
+
+on:
+  schedule:
+    - cron: "17 5 * * *"
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v4
+      - id: check
+        run: dev/check-allowlist.sh > result.txt 2>&1 || echo "changed=true" >> "$GITHUB_OUTPUT"; cat result.txt
+      - if: steps.check.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          title="MailFlow's API-token allowlist changed upstream"
+          if [ -z "$(gh issue list --state open --search "\"$title\" in:title" --json number -q '.[].number')" ]; then
+            gh issue create --title "$title" --body "$(cat result.txt)
+
+          Check the routes in server.py's ALLOWED_CALLS against the new list, run dev/live-smoke.py, then record the new hash with dev/check-allowlist.sh --update."
+          fi

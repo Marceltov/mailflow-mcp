@@ -1,0 +1,27 @@
+[project]
+name = "mailflow_mcp"
+version = "0.1.0"
+description = "MCP server for MailFlow webmail over its personal API tokens: read mail and save drafts, never send"
+license = "AGPL-3.0-or-later"
+requires-python = ">=3.11"
+dependencies = [
+    "fastmcp>=3.4",
+    "httpx2>=2.16",
+    "truststore>=0.10",
+    "uvicorn>=0.30",
+]
+
+[tool.uv]
+# Single-module app, as in paperless-ngx-mcp: install only the dependencies.
+package = false
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.0",
+    "ruff>=0.14",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"

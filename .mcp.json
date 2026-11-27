@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "mailflow": {
+      "type": "http",
+      "url": "https://mailflow-mcp.example.org/mcp",
+      "headers": { "Authorization": "Bearer YOUR_MAILFLOW_API_TOKEN" }
+    }
+  }
+}
