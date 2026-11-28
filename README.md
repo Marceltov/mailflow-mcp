@@ -1,8 +1,14 @@
 # mailflow-mcp
 
-An MCP server for [MailFlow](https://github.com/maathimself/mailflow) webmail. It gives Claude (or any MCP client) read access to your mailboxes and lets it save plain-text drafts, through MailFlow's personal API tokens. **It cannot send mail**: MailFlow's token API has no route that sends, and this server only calls the routes it needs. You review each draft in MailFlow and send it there.
+An MCP server for [MailFlow](https://github.com/maathimself/mailflow) webmail. It lets Claude (or any MCP client) read your mailboxes, organize them and save plain-text drafts, through MailFlow's personal API tokens. **It cannot send or delete mail**: MailFlow's token API has no route that does, and this server only calls the routes it needs. You review each draft in MailFlow and send it there.
 
-Tools: `list_accounts`, `list_folders`, `list_messages`, `get_message`, `get_thread`, `search_messages`, `search_contacts`, `unread_counts`, `create_draft`.
+| Scope | Tools |
+|---|---|
+| read | `list_accounts`, `list_folders`, `list_messages`, `get_message`, `get_thread`, `search_messages`, `search_contacts`, `unread_counts`, `category_counts` |
+| organize | `mark_read`, `star_messages`, `archive_messages`, `move_messages`, `snooze_message`, `unsnooze_message`, `set_category` |
+| draft | `create_draft` |
+
+The token's scopes decide what a client may do: a tool whose scope the token lacks is refused by MailFlow, and the answer names the scope. MailFlow never lets a token move mail into Trash, Junk, Drafts or Snoozed.
 
 ## Run it next to MailFlow
 
@@ -33,7 +39,7 @@ Publish it over HTTPS behind your reverse proxy. The server holds no secret: eac
 
 ## Connect a client
 
-Create a token in MailFlow (Settings → API tokens) with the scopes **read** and **draft**, then:
+Create a token in MailFlow (Settings → Security → API tokens) with the scopes the client should have (read, organize, draft), then:
 
 ```bash
 claude mcp add mailflow --scope user --transport http https://mailflow-mcp.example.org/mcp \
