@@ -57,7 +57,8 @@ TOKEN_RE = re.compile(r"^mfat_[A-Za-z0-9_-]{43}$")
 
 # Every MailFlow call this server may make: (method, path pattern). A subset of MailFlow's
 # apiTokenAllowlist.js. The transport refuses anything else before it leaves the process, so a
-# bug here can never reach a send, delete or settings route.
+# bug here can never reach a send, delete or settings route. Which of them a token may use is its
+# scopes' business (read, organize, draft): MailFlow refuses the rest, and the tool says which scope.
 _UUID = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 ALLOWED_CALLS = (
     ("GET", r"/api/health"),
@@ -70,8 +71,18 @@ ALLOWED_CALLS = (
     ("GET", r"/api/mail/resolve-message"),
     ("GET", r"/api/mail/thread"),
     ("GET", r"/api/mail/unread-counts"),
+    ("GET", r"/api/mail/category-counts"),
     ("GET", r"/api/search"),
     ("GET", r"/api/search/contacts"),
+    # organize: flags, archive, move (MailFlow refuses Trash, Junk, Drafts and Snoozed), snooze, category
+    ("POST", r"/api/mail/messages/bulk-read"),
+    ("POST", r"/api/mail/messages/bulk-star"),
+    ("POST", r"/api/mail/messages/bulk-archive"),
+    ("POST", r"/api/mail/messages/bulk-move"),
+    ("POST", rf"/api/mail/messages/{_UUID}/snooze"),
+    ("PATCH", rf"/api/mail/messages/{_UUID}/snooze"),
+    ("POST", rf"/api/mail/messages/{_UUID}/unsnooze"),
+    ("PATCH", rf"/api/mail/messages/{_UUID}/category"),
     ("POST", r"/api/mail/draft"),
 )
 _ALLOWED = tuple((method, re.compile(f"^{pattern}$")) for method, pattern in ALLOWED_CALLS)
@@ -196,8 +207,9 @@ def _error_text(response) -> str:
         message = None
     message = message or response.text[:300] or response.reason_phrase
     hint = {
-        401: " The MailFlow API token is invalid or expired: create a new one in MailFlow (Settings → API tokens).",
-        403: " The token may lack the scope this needs (read for reading, draft for drafts).",
+        401: " The MailFlow API token is invalid or expired: create a new one in MailFlow (Settings → Security → API tokens).",
+        403: " If the token lacks a scope (read for reading; organize for flags, archive, move, snooze and categories;"
+        " draft for drafts), the user can create one that has it in MailFlow (Settings → Security → API tokens).",
         429: f" Rate limited; retry after {response.headers.get('Retry-After', 'a while')} seconds.",
     }.get(response.status_code, "")
     return f"MailFlow answered {response.status_code}: {message}.{hint}"
@@ -407,23 +419,34 @@ def quote_block(original: dict, text: str) -> str:
 
 INSTRUCTIONS = """\
 Tools for the user's MailFlow webmail, which brings all their mailboxes together. You can read \
-mail and save drafts. You cannot send, delete, move or change mail: the user reviews every draft \
-in MailFlow and sends it there.
+mail, organize it (read/unread, star, archive, move to a folder, snooze, set the category) and \
+save drafts. You cannot send or delete mail, nor move it into Trash or Junk: the user reviews \
+every draft in MailFlow and sends it there.
 
 - Start with list_accounts: every other tool takes account ids (UUIDs) from it.
 - Find mail with search_messages (operators like from:, subject:, after:) rather than paging \
 through list_messages. Lists return short summaries; read one message in full with get_message.
 - Message ids are MailFlow's row UUIDs. They change when a message moves folder, so look a \
 message up again rather than reusing an id from an earlier conversation.
+- What a tool may do depends on the token's scopes (read, organize, draft). A refused call says \
+which scope is missing; tell the user, don't retry.
+- Organize what the user asked for. Before archiving or moving messages they haven't named one \
+by one (everything from a sender, a whole search), say which and how many, and wait for a yes.
 - create_draft saves into the account's Drafts folder at once. Show the user the full text first \
 (call it with preview_only=true to get exactly what will be saved), and only save once they agree.
 """
 
 READ = ToolAnnotations(read_only_hint=True, destructive_hint=False, idempotent_hint=True, open_world_hint=False)
 WRITE_DRAFT = ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=False, open_world_hint=False)
+ORGANIZE = ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=True, open_world_hint=False)
+
+Category = Literal["primary", "newsletter", "promotion", "automated", "social"]
 
 AccountId = Annotated[str, Field(description="Account UUID from list_accounts.")]
 MessageId = Annotated[str, Field(description="Message UUID from list_messages, search_messages or get_thread.")]
+MessageIds = Annotated[
+    list[str], Field(min_length=1, max_length=500, description="Message UUIDs from list_messages, search_messages or get_thread (up to 500).")
+]
 
 
 def register_tools(mcp: FastMCP, mailflow: MailFlow) -> None:
@@ -453,9 +476,7 @@ as `folder`), name, special use (\\\\Sent, \\\\Drafts, \\\\Trash, …) and messa
         offset: Annotated[int, Field(ge=0, description="Messages to skip, for paging.")] = 0,
         unread_only: bool = False,
         threaded: Annotated[bool, Field(description="One row per conversation, with thread_id and message_count.")] = False,
-        category: Annotated[
-            Literal["primary", "newsletter", "promotion", "automated", "social"] | None, Field(description="Only messages MailFlow put in this category.")
-        ] = None,
+        category: Annotated[Category | None, Field(description="Only messages MailFlow put in this category.")] = None,
         sort: Literal["date", "from", "subject"] = "date",
         direction: Literal["asc", "desc"] = "desc",
     ) -> dict:
@@ -572,6 +593,95 @@ count is fresh, and how many messages are snoozed or scheduled."""
         if data.get("complete") is False:
             out["guidance"] = ["Some counts are stale or not counted yet (MailFlow is still syncing); say so if you report them."]
         return out
+
+    @mcp.tool(annotations=READ)
+    async def category_counts(account_id: Annotated[str | None, Field(description="Only this account; default: the unified inbox.")] = None) -> dict:
+        """How many Inbox messages MailFlow put in each category (primary, newsletter, promotion, \
+automated, social): `unread` and `total` per category."""
+        data = await mailflow.get("/api/mail/category-counts", accountId=account_id)
+        return {"unread": data.get("counts") or {}, "total": data.get("totals") or {}}
+
+    # ── organize (scope organize) ──
+
+    def not_found(ids: list[str], done: list[str]) -> list[str]:
+        return [i for i in ids if i not in set(done)]
+
+    def changed(key: str, ids: list[str], done: list[str], what: str) -> dict:
+        out: dict[str, Any] = {key: done}
+        missing = not_found(ids, done)
+        if missing:
+            out["unchanged"] = missing
+            out["guidance"] = [f"{len(missing)} message(s) were not {what}: already so, or not found (ids change when mail moves folder)."]
+        return out
+
+    @mcp.tool(annotations=ORGANIZE)
+    async def mark_read(message_ids: MessageIds, read: Annotated[bool, Field(description="false marks them unread.")] = True) -> dict:
+        """Mark messages read or unread, in MailFlow and on the mail server."""
+        data = await mailflow.request("POST", "/api/mail/messages/bulk-read", json={"ids": message_ids, "read": read})
+        return changed("updated", message_ids, data.get("updated") or [], "marked read" if read else "marked unread")
+
+    @mcp.tool(annotations=ORGANIZE)
+    async def star_messages(message_ids: MessageIds, starred: Annotated[bool, Field(description="false removes the star.")] = True) -> dict:
+        """Star messages, or remove their star (the mail server's \\Flagged)."""
+        data = await mailflow.request("POST", "/api/mail/messages/bulk-star", json={"ids": message_ids, "starred": starred})
+        return changed("updated", message_ids, data.get("updated") or [], "starred" if starred else "unstarred")
+
+    @mcp.tool(annotations=ORGANIZE)
+    async def archive_messages(message_ids: MessageIds) -> dict:
+        """Move messages into their account's archive folder, as MailFlow's Archive button does. \
+Drafts can't be archived, and MailFlow refuses an archive folder that is Trash, Junk or Gmail's \
+All Mail."""
+        data = await mailflow.request("POST", "/api/mail/messages/bulk-archive", json={"ids": message_ids})
+        out = changed("archived", message_ids, data.get("archived") or [], "archived")
+        if data.get("noArchiveFolder"):
+            out["accounts_without_archive_folder"] = data["noArchiveFolder"]
+            out.setdefault("guidance", []).append("Some accounts have no archive folder: the user picks one in MailFlow's account settings.")
+        out.setdefault("guidance", []).append("Archived messages have new ids; look them up again before acting on them.")
+        return out
+
+    @mcp.tool(annotations=ORGANIZE)
+    async def move_messages(
+        message_ids: MessageIds,
+        folder: Annotated[str, Field(description="Destination folder path from list_folders; it must exist in each message's account.")],
+    ) -> dict:
+        """Move messages into another folder of their account. MailFlow refuses Trash, Junk, \
+Drafts, Snoozed and folders it doesn't sync, and won't move drafts."""
+        data = await mailflow.request("POST", "/api/mail/messages/bulk-move", json={"ids": message_ids, "folder": folder})
+        out = changed("moved", message_ids, data.get("moved") or [], f"moved to {folder}")
+        out.setdefault("guidance", []).append("Moved messages have new ids; look them up again before acting on them.")
+        return out
+
+    @mcp.tool(annotations=ORGANIZE)
+    async def snooze_message(
+        message_id: MessageId,
+        until: Annotated[datetime, Field(description="When it comes back, ISO 8601 with time zone; in the future and at most 30 days away.")],
+    ) -> dict:
+        """Snooze a message and the replies in its conversation until a time: they leave the folder \
+and come back then. A message that is already snoozed gets the new time."""
+        if until.tzinfo is None:
+            raise ToolError("Give `until` with a time zone, e.g. 2026-12-01T08:00:00+01:00.")
+        body = {"until": until.isoformat()}
+        try:
+            await mailflow.request("POST", f"/api/mail/messages/{message_id}/snooze", json=body)
+        except ToolError as err:
+            if not any(s in str(err).lower() for s in ("already snoozed", "already in snoozed")):
+                raise
+            await mailflow.request("PATCH", f"/api/mail/messages/{message_id}/snooze", json=body)
+            return {"snoozed": True, "until": body["until"], "rescheduled": True}
+        return {"snoozed": True, "until": body["until"], "guidance": ["Snoozed messages get new ids; unsnooze_message takes the snoozed copy's id."]}
+
+    @mcp.tool(annotations=ORGANIZE)
+    async def unsnooze_message(message_id: Annotated[str, Field(description="The snoozed message's UUID (in the Snoozed folder).")]) -> dict:
+        """Bring a snoozed conversation back now, to the folder it was snoozed from."""
+        data = await mailflow.request("POST", f"/api/mail/messages/{message_id}/unsnooze")
+        return {"unsnoozed": True, "restored": data.get("restored")}
+
+    @mcp.tool(annotations=ORGANIZE)
+    async def set_category(message_id: MessageId, category: Category) -> dict:
+        """Put a message in another category (primary, newsletter, promotion, automated, social), \
+overriding MailFlow's own sorting for it."""
+        await mailflow.request("PATCH", f"/api/mail/messages/{message_id}/category", json={"category": category})
+        return {"message_id": message_id, "category": category}
 
     @mcp.tool(annotations=WRITE_DRAFT)
     async def create_draft(

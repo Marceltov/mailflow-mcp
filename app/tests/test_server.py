@@ -55,6 +55,7 @@ class FakeMailFlow:
     def __init__(self):
         self.calls: list[httpx.Request] = []
         self.status: dict[str, int] = {}
+        self.snoozed = False
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
         self.calls.append(request)
@@ -79,6 +80,20 @@ class FakeMailFlow:
             return httpx.Response(200, json={"messages": [ORIGINAL], "query": request.url.params["q"]})
         if path == "/api/mail/unread-counts":
             return httpx.Response(200, json={"total": 3, "byAccount": {ACCOUNT: 3}, "complete": True, "snoozed": 0, "scheduled": {"pending": 0}})
+        if path == "/api/mail/category-counts":
+            return httpx.Response(200, json={"counts": {"primary": 2}, "totals": {"primary": 9}})
+        if path.endswith(("/bulk-read", "/bulk-star")):
+            return httpx.Response(200, json={"ok": True, "updated": [MSG]})
+        if path.endswith("/bulk-archive"):
+            return httpx.Response(200, json={"ok": True, "archived": [MSG], "noArchiveFolder": []})
+        if path.endswith("/bulk-move"):
+            return httpx.Response(200, json={"ok": True, "moved": [MSG]})
+        if path == f"/api/mail/messages/{MSG}/snooze" and request.method == "POST" and self.snoozed:
+            return httpx.Response(400, json={"error": "Message is already snoozed"})
+        if path.endswith(("/snooze", "/category")):
+            return httpx.Response(200, json={"ok": True})
+        if path.endswith("/unsnooze"):
+            return httpx.Response(200, json={"ok": True, "restored": 2})
         if path == "/api/mail/draft":
             return httpx.Response(200, json={"uid": 99, "folder": "Entwürfe", "messageId": "<new@3dbruckner.de>"})
         return httpx.Response(404, json={"error": "not faked"})
@@ -86,6 +101,9 @@ class FakeMailFlow:
     def posted(self) -> dict:
         [post] = [c for c in self.calls if c.method == "POST"]
         return json.loads(post.content)
+
+    def writes(self) -> list[tuple[str, str, dict]]:
+        return [(c.method, c.url.path, json.loads(c.content) if c.content else {}) for c in self.calls if c.method != "GET"]
 
 
 @pytest.fixture
@@ -113,7 +131,7 @@ async def call(mcp, name, **args):
 # ── Safety ──────────────────────────────────────────────────────────────────
 
 
-async def test_exactly_the_v01_tools_and_no_send(mcp):
+async def test_exactly_these_tools_and_no_send_or_delete(mcp):
     names = {t.name for t in await mcp.list_tools()}
     assert names == {
         "list_accounts",
@@ -124,16 +142,26 @@ async def test_exactly_the_v01_tools_and_no_send(mcp):
         "search_messages",
         "search_contacts",
         "unread_counts",
+        "category_counts",
+        "mark_read",
+        "star_messages",
+        "archive_messages",
+        "move_messages",
+        "snooze_message",
+        "unsnooze_message",
+        "set_category",
         "create_draft",
     }
-    assert not any("send" in n for n in names)
+    assert not any("send" in n or "delete" in n or "trash" in n for n in names)
 
 
 @pytest.mark.parametrize(
     ("method", "path"),
     [
         ("POST", "/api/mail/send"),
-        ("POST", "/api/mail/messages/bulk-move"),
+        ("POST", "/api/mail/messages/bulk-delete"),
+        ("POST", "/api/mail/messages/bulk-spam"),
+        ("PATCH", f"/api/mail/messages/{MSG}/read"),
         ("DELETE", "/api/mail/draft/5"),
         ("POST", "/api/auth/login"),
         ("GET", f"/api/mail/messages/{MSG}/raw"),
@@ -145,8 +173,8 @@ def test_guard_refuses_everything_else(method, path):
 
 
 def test_no_allowed_call_sends():
-    assert not any("send" in p or "scheduled" in p for _, p in server.ALLOWED_CALLS)
-    assert [m for m, p in server.ALLOWED_CALLS if m != "GET"] == ["POST"]
+    assert not any(w in p for _, p in server.ALLOWED_CALLS for w in ("send", "scheduled", "delete", "trash", "spam"))
+    assert {m for m, _ in server.ALLOWED_CALLS} == {"GET", "POST", "PATCH"}
 
 
 async def test_guarded_transport_raises_before_the_network(fake):
@@ -280,7 +308,7 @@ async def test_unread_counts(mcp):
 
 async def test_mailflow_errors_become_tool_errors(mcp, fake):
     fake.status["/api/accounts"] = 403
-    with pytest.raises(ToolError, match=r"403.*draft scope.*scope this needs"):
+    with pytest.raises(ToolError, match=r"403.*draft scope.*lacks a scope"):
         await call(mcp, "list_accounts")
 
 
@@ -355,3 +383,59 @@ async def test_list_folders_drops_sync_state(mcp, monkeypatch):
     monkeypatch.setattr(FakeMailFlow, "__call__", lambda self, r: httpx.Response(200, json=[row]) if r.url.path.endswith("/folders") else original(self, r))
     [folder] = await call(mcp, "list_folders", account_id=ACCOUNT)
     assert folder == {"path": "INBOX", "name": "INBOX", "special_use": None, "total_count": 5, "unread_count": 1}
+
+
+# ── Organize ────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    ("tool", "args", "path", "body"),
+    [
+        ("mark_read", {"message_ids": [MSG]}, "/api/mail/messages/bulk-read", {"ids": [MSG], "read": True}),
+        ("mark_read", {"message_ids": [MSG], "read": False}, "/api/mail/messages/bulk-read", {"ids": [MSG], "read": False}),
+        ("star_messages", {"message_ids": [MSG]}, "/api/mail/messages/bulk-star", {"ids": [MSG], "starred": True}),
+        ("archive_messages", {"message_ids": [MSG]}, "/api/mail/messages/bulk-archive", {"ids": [MSG]}),
+        ("move_messages", {"message_ids": [MSG], "folder": "Paperless"}, "/api/mail/messages/bulk-move", {"ids": [MSG], "folder": "Paperless"}),
+        ("set_category", {"message_id": MSG, "category": "newsletter"}, f"/api/mail/messages/{MSG}/category", {"category": "newsletter"}),
+    ],
+)
+async def test_organize_tools_call_mailflow(mcp, fake, tool, args, path, body):
+    await call(mcp, tool, **args)
+    [(_, sent_path, sent)] = fake.writes()
+    assert sent_path == path and sent == body
+
+
+async def test_unchanged_messages_are_reported(mcp):
+    other = "55555555-5555-4555-8555-555555555555"
+    data = await call(mcp, "mark_read", message_ids=[MSG, other])
+    assert data["updated"] == [MSG] and data["unchanged"] == [other] and data["guidance"]
+
+
+async def test_snooze_needs_a_time_zone(mcp, fake):
+    with pytest.raises(ToolError, match="time zone"):
+        await call(mcp, "snooze_message", message_id=MSG, until="2026-12-01T08:00:00")
+    assert fake.writes() == []
+
+
+async def test_snooze_and_reschedule(mcp, fake):
+    await call(mcp, "snooze_message", message_id=MSG, until="2026-12-01T08:00:00+01:00")
+    assert fake.writes() == [("POST", f"/api/mail/messages/{MSG}/snooze", {"until": "2026-12-01T08:00:00+01:00"})]
+    fake.calls.clear()
+    fake.snoozed = True
+    data = await call(mcp, "snooze_message", message_id=MSG, until="2026-12-02T08:00:00+01:00")
+    assert data["rescheduled"] and [w[0] for w in fake.writes()] == ["POST", "PATCH"]
+
+
+async def test_unsnooze(mcp, fake):
+    data = await call(mcp, "unsnooze_message", message_id=MSG)
+    assert data == {"unsnoozed": True, "restored": 2}
+
+
+async def test_category_counts(mcp):
+    assert await call(mcp, "category_counts") == {"unread": {"primary": 2}, "total": {"primary": 9}}
+
+
+async def test_a_missing_scope_names_it(mcp, fake):
+    fake.status["/api/mail/messages/bulk-archive"] = 403
+    with pytest.raises(ToolError, match=r"403.*organize for flags"):
+        await call(mcp, "archive_messages", message_ids=[MSG])

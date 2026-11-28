@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-MCP server for [MailFlow](https://github.com/maathimself/mailflow) over its personal API tokens (#617): read mail and save plain-text drafts. One module, `app/server.py`; FastMCP over streamable HTTP, `httpx2`, config from the environment only. The server holds no secret: it forwards the client's `mfat_…` token to MailFlow as `Authorization: Bearer <token>`.
+MCP server for [MailFlow](https://github.com/maathimself/mailflow) over its personal API tokens (#617): read mail, organize it and save plain-text drafts; the token's scopes decide which. One module, `app/server.py`; FastMCP over streamable HTTP, `httpx2`, config from the environment only. The server holds no secret: it forwards the client's `mfat_…` token to MailFlow as `Authorization: Bearer <token>`.
 
 ## Commands
 
@@ -17,8 +17,8 @@ CI (`.github/workflows/publish.yml`): tests and Ruff on every push and PR; every
 
 ## Rules that are easy to break
 
-- **Never a send tool**, and nothing that moves, deletes or changes mail. `ALLOWED_CALLS` lists every MailFlow route the server may call; `GuardedTransport` refuses the rest before the request leaves. Adding a route means adding it there, and it must be on MailFlow's `backend/src/services/apiTokenAllowlist.js`.
-- **Against a live instance, only read.** `dev/live-smoke.py` calls read tools only and prints shapes, never mail content. A draft against the live instance only after the user has seen its full text.
+- **Never a send tool**, and nothing that deletes mail or moves it into Trash or Junk (organize tools stay within MailFlow's guards, ADR 0002). `ALLOWED_CALLS` lists every MailFlow route the server may call; `GuardedTransport` refuses the rest before the request leaves. Adding a route means adding it there, and it must be on MailFlow's `backend/src/services/apiTokenAllowlist.js`.
+- **Against a live instance, only read.** `dev/live-smoke.py` calls read tools only and prints shapes, never mail content. Organize tools change the user's mail: against a live instance only what the user asked for. A draft against the live instance only after the user has seen its full text.
 - **Drafts follow MailFlow's composer**: reply headers, quote format and alias choice mirror `frontend/src/utils/composeFromMessage.js`; signature off is `editedSignature: ""`; the account's automatic Cc/Bcc are added. MailFlow's draft guard (`middleware/apiTokenGuards.js`) refuses HTML, attachments and replacing a draft.
 
 ## Conventions left out
