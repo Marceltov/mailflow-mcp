@@ -25,7 +25,7 @@ import truststore
 import uvicorn
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
-from mcp.types import ToolAnnotations
+from mcp.types import Icon, ToolAnnotations
 from pydantic import Field
 from starlette.requests import Request
 from starlette.responses import PlainTextResponse
@@ -786,8 +786,19 @@ def register_health(mcp: FastMCP) -> None:
         return PlainTextResponse("ok")
 
 
+def icons() -> list[Icon]:
+    """MailFlow's own icons, served by the MailFlow this server fronts: a client shows the
+    connector with MailFlow's logo."""
+    base = public_url()
+    return [
+        Icon(src=f"{base}/favicon.svg", mimeType="image/svg+xml", sizes=["any"]),
+        Icon(src=f"{base}/icon-192.png", mimeType="image/png", sizes=["192x192"]),
+        Icon(src=f"{base}/icon-512.png", mimeType="image/png", sizes=["512x512"]),
+    ]
+
+
 def build_server(client: httpx.AsyncClient | None = None) -> FastMCP:
-    mcp = FastMCP(name="MailFlow MCP", instructions=INSTRUCTIONS)
+    mcp = FastMCP(name="MailFlow", instructions=INSTRUCTIONS, icons=icons())
     register_tools(mcp, MailFlow(client or build_client()))
     register_health(mcp)
     return mcp
