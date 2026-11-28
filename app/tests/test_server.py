@@ -439,3 +439,13 @@ async def test_a_missing_scope_names_it(mcp, fake):
     fake.status["/api/mail/messages/bulk-archive"] = 403
     with pytest.raises(ToolError, match=r"403.*organize for flags"):
         await call(mcp, "archive_messages", message_ids=[MSG])
+
+
+async def test_server_info_names_mailflows_icons(mcp):
+    info = mcp.server_info
+    assert info.name == "MailFlow"
+    assert [i.src for i in info.icons] == [
+        "https://mail.example.org/favicon.svg",
+        "https://mail.example.org/icon-192.png",
+        "https://mail.example.org/icon-512.png",
+    ]
